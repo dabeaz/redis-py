@@ -4,14 +4,13 @@ from redis import __version__
 sdict = {
     'name' : 'redis',
     'version' : __version__,
-    'description' : 'Python client for Redis key-value store',
-    'long_description' : 'Python client for Redis key-value store',
-    'url': 'http://github.com/andymccurdy/redis-py',
-    'download_url' : 'http://cloud.github.com/downloads/andymccurdy/redis-py/redis-%s.tar.gz' % __version__,
+    'description' : 'Python 3 client for Redis key-value store',
+    'long_description' : 'Python 3 client for Redis key-value store',
+    'url': 'http://github.com/dabeaz/redis-py',
     'author' : 'Andy McCurdy',
     'author_email' : 'sedrik@gmail.com',
-    'maintainer' : 'Andy McCurdy',
-    'maintainer_email' : 'sedrik@gmail.com',
+    'maintainer' : 'David Beazley',
+    'maintainer_email' : 'dave@dabeaz.com',
     'keywords' : ['Redis', 'key-value store'],
     'license' : 'MIT',
     'packages' : ['redis'],
@@ -22,7 +21,7 @@ sdict = {
         'Intended Audience :: Developers',
         'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
-        'Programming Language :: Python'],
+        'Programming Language :: Python :: 3',
 }
 
 try:

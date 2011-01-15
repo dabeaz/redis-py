@@ -1,3 +1,15 @@
+redis-py-py3k
+=============
+This is a Python 3 port of redis-py performed by David Beazley
+(http://www.dabeaz.com).  It works for simple examples I have tried,
+but it needs more exhaustive testing.
+
+No attempt was made at preserving backwards compatibility--in fact, I
+simply deleted all parts of the library marked as "deprecated."  Be
+aware that I am only maintaining this port for my personal use until
+an official "Python 3" compatibile redis-py client is released by the
+core maintainers.  Use at your own risk.  --Dave
+
 redis-py
 ========
 

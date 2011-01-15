@@ -1,13 +1,24 @@
+# client.py
+#
+# Python 3 redis client.
+# Based on redis-py, http://github.com/andymccurdy/redis-py.
+#
+# Ported to Python-3 by David Beazley (http://www.dabeaz.com)
+
 import datetime
 import errno
 import socket
 import threading
 import time
-import warnings
-from itertools import chain, imap
-from redis.exceptions import ConnectionError, ResponseError, InvalidResponse, WatchError
-from redis.exceptions import RedisError, AuthenticationError
+import collections
+import numbers
+import itertools
+from .exceptions import (ConnectionError, ResponseError, 
+                        InvalidResponse, WatchError,
+                        RedisError, AuthenticationError )
 
+# Types treated as "strings" in type-checking
+redis_string_types = (str, collections.ByteString)
 
 class ConnectionPool(threading.local):
     "Manages a list of connections on the local thread"
@@ -28,10 +39,10 @@ class ConnectionPool(threading.local):
 
     def get_all_connections(self):
         "Return a list of all connection objects the manager knows about"
-        return self.connections.values()
+        return list(self.connections.values())
 
 
-class Connection(object):
+class Connection:
     "Manages TCP communication to and from a Redis server"
     def __init__(self, host='localhost', port=6379, db=0, password=None,
                  socket_timeout=None):
@@ -41,7 +52,7 @@ class Connection(object):
         self.password = password
         self.socket_timeout = socket_timeout
         self._sock = None
-        self._fp = None
+        self._inbuffer = bytearray()
 
     def connect(self, redis_instance):
         "Connects to the Redis server if not already connected"
@@ -51,7 +62,7 @@ class Connection(object):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.socket_timeout)
             sock.connect((self.host, self.port))
-        except socket.error, e:
+        except socket.error as e:
             # args for socket.error can either be (errno, "message")
             # or just "message"
             if len(e.args) == 1:
@@ -63,7 +74,6 @@ class Connection(object):
             raise ConnectionError(error_message)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
         self._sock = sock
-        self._fp = sock.makefile('r')
         redis_instance._setup_connection()
 
     def disconnect(self):
@@ -75,22 +85,53 @@ class Connection(object):
         except socket.error:
             pass
         self._sock = None
-        self._fp = None
+        self._inchunks = bytearray()
 
     def send(self, command, redis_instance):
         "Send ``command`` to the Redis server. Return the result."
         self.connect(redis_instance)
         try:
             self._sock.sendall(command)
-        except socket.error, e:
+        except socket.error as e:
             if e.args[0] == errno.EPIPE:
                 self.disconnect()
-            if isinstance(e.args, basestring):
-                _errno, errmsg = 'UNKNOWN', e.args
+            if isinstance(e.args, str):
+                errno, errmsg = 'UNKNOWN', e.args
             else:
-                _errno, errmsg = e.args
+                errno, errmsg = e.args
             raise ConnectionError("Error %s while writing to socket. %s." % \
-                (_errno, errmsg))
+                (errno, errmsg))
+
+    def _read_length(self,length):
+        """
+        Read a fixed number of bytes on a socket.
+        """
+        chunk = self._inbuffer[:length]
+        if chunk:
+            del self._inbuffer[:length]
+        chunks = [chunk]
+        length -= len(chunk)
+        while length > 0:
+            chunk = self._sock.recv(length)
+            if not chunk:
+                break
+            length -= len(chunk)
+            chunks.append(chunk)
+        return b''.join(chunks)
+
+    def _readline(self):
+        while True:
+            nl_index = self._inbuffer.find(b'\n')
+            if nl_index >= 0:
+                line = self._inbuffer[0:nl_index+1]
+                del self._inbuffer[0:nl_index+1]
+                return line
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                line = self._inbuffer
+                self._inbuffer = bytearray()
+                return line
+            self._inbuffer.extend(chunk)
 
     def read(self, length=None):
         """
@@ -99,36 +140,15 @@ class Connection(object):
         """
         try:
             if length is not None:
-                return self._fp.read(length)
-            return self._fp.readline()
-        except socket.error, e:
+                return self._read_length(length)
+            else:
+                return self._readline()
+        except socket.error as e:
             self.disconnect()
             if e.args and e.args[0] == errno.EAGAIN:
                 raise ConnectionError("Error while reading from socket: %s" % \
                     e.args[1])
-        return ''
-
-def list_or_args(command, keys, args):
-    # returns a single list combining keys and args
-    # if keys is not a list or args has items, issue a
-    # deprecation warning
-    oldapi = bool(args)
-    try:
-        i = iter(keys)
-        # a string can be iterated, but indicates
-        # keys wasn't passed as a list
-        if isinstance(keys, basestring):
-            oldapi = True
-    except TypeError:
-        oldapi = True
-        keys = [keys]
-    if oldapi:
-        warnings.warn(DeprecationWarning(
-            "Passing *args to Redis.%s has been deprecated. "
-            "Pass an iterable to ``keys`` instead" % command
-        ))
-        keys.extend(args)
-    return keys
+        return b''
 
 def timestamp_to_datetime(response):
     "Converts a unix timestamp to a Python datetime object"
@@ -152,18 +172,20 @@ def parse_info(response):
     "Parse the result of Redis's INFO command into a Python dict"
     info = {}
     def get_value(value):
-        if ',' not in value:
+        if b',' not in value:
             return value
         sub_dict = {}
-        for item in value.split(','):
-            k, v = item.split('=')
+        for item in value.split(b','):
+            k, v = item.split(b'=')
+            k = k.decode('utf-8')
             try:
                 sub_dict[k] = int(v)
             except ValueError:
                 sub_dict[k] = v
         return sub_dict
     for line in response.splitlines():
-        key, value = line.split(':')
+        key, value = line.split(b':')
+        key = key.decode('utf-8')
         try:
             info[key] = int(value)
         except ValueError:
@@ -181,7 +203,7 @@ def zset_score_pairs(response, **options):
     """
     if not response or not options['withscores']:
         return response
-    return zip(response[::2], map(float, response[1::2]))
+    return list(zip(response[::2], (float(x) for x in response[1::2])))
 
 def int_or_none(response):
     if response is None:
@@ -195,9 +217,9 @@ def float_or_none(response):
 
 def parse_config(response, **options):
     # this is stupid, but don't have a better option right now
-    if options['parse'] == 'GET':
+    if options['parse'] == b'GET':
         return response and pairs_to_dict(response) or {}
-    return response == 'OK'
+    return response == b'OK'
 
 class Redis(threading.local):
     """
@@ -211,62 +233,59 @@ class Redis(threading.local):
     """
     RESPONSE_CALLBACKS = dict_merge(
         string_keys_to_dict(
-            'AUTH DEL EXISTS EXPIRE EXPIREAT HDEL HEXISTS HMSET MOVE MSETNX '
-            'PERSIST RENAMENX SADD SISMEMBER SMOVE SETEX SETNX SREM ZADD ZREM',
+            b'AUTH DEL EXISTS EXPIRE EXPIREAT HDEL HEXISTS HMSET MOVE MSETNX '
+            b'PERSIST RENAMENX SADD SISMEMBER SMOVE SETEX SETNX SREM ZADD ZREM',
             bool
             ),
         string_keys_to_dict(
-            'DECRBY GETBIT HLEN INCRBY LINSERT LLEN LPUSHX RPUSHX SCARD '
-            'SDIFFSTORE SETBIT SETRANGE SINTERSTORE STRLEN SUNIONSTORE ZCARD '
-            'ZREMRANGEBYRANK ZREMRANGEBYSCORE',
+            b'DECRBY GETBIT HLEN INCRBY LINSERT LLEN LPUSHX RPUSHX SCARD '
+            b'SDIFFSTORE SETBIT SETRANGE SINTERSTORE STRLEN SUNIONSTORE ZCARD '
+            b'ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREVRANK',
             int
             ),
         string_keys_to_dict(
             # these return OK, or int if redis-server is >=1.3.4
-            'LPUSH RPUSH',
-            lambda r: isinstance(r, int) and r or r == 'OK'
+            b'LPUSH RPUSH',
+            lambda r: isinstance(r, int) and r or r == b'OK'
             ),
-        string_keys_to_dict('ZSCORE ZINCRBY', float_or_none),
+        string_keys_to_dict(b'ZSCORE ZINCRBY', float_or_none),
         string_keys_to_dict(
-            'FLUSHALL FLUSHDB LSET LTRIM MSET RENAME '
-            'SAVE SELECT SET SHUTDOWN SLAVEOF WATCH UNWATCH',
-            lambda r: r == 'OK'
+            b'FLUSHALL FLUSHDB LSET LTRIM MSET RENAME '
+            b'SAVE SELECT SET SHUTDOWN SLAVEOF WATCH UNWATCH',
+            lambda r: r == b'OK'
             ),
-        string_keys_to_dict('BLPOP BRPOP', lambda r: r and tuple(r) or None),
-        string_keys_to_dict('SDIFF SINTER SMEMBERS SUNION',
+        string_keys_to_dict(b'BLPOP BRPOP', lambda r: r and tuple(r) or None),
+        string_keys_to_dict(b'SDIFF SINTER SMEMBERS SUNION',
             lambda r: r and set(r) or set()
             ),
-        string_keys_to_dict('ZRANGE ZRANGEBYSCORE ZREVRANGE', zset_score_pairs),
-        string_keys_to_dict('ZRANK ZREVRANK', int_or_none),
+        string_keys_to_dict(b'ZRANGE ZRANGEBYSCORE ZREVRANGE', zset_score_pairs),
         {
-            'BGREWRITEAOF': lambda r: \
-                r == 'Background rewriting of AOF file started',
-            'BGSAVE': lambda r: r == 'Background saving started',
-            'BRPOPLPUSH': lambda r: r and r or None,
-            'CONFIG': parse_config,
-            'HGETALL': lambda r: r and pairs_to_dict(r) or {},
-            'INFO': parse_info,
-            'LASTSAVE': timestamp_to_datetime,
-            'PING': lambda r: r == 'PONG',
-            'RANDOMKEY': lambda r: r and r or None,
-            'TTL': lambda r: r != -1 and r or None,
+            b'BGREWRITEAOF': lambda r: \
+                r == b'Background rewriting of AOF file started',
+            b'BGSAVE': lambda r: r == b'Background saving started',
+            b'BRPOPLPUSH': lambda r: r and r or None,
+            b'CONFIG': parse_config,
+            b'HGETALL': lambda r: r and pairs_to_dict(r) or {},
+            b'INFO': parse_info,
+            b'LASTSAVE': timestamp_to_datetime,
+            b'PING': lambda r: r == b'PONG',
+            b'RANDOMKEY': lambda r: r and r or None,
+            b'TTL': lambda r: r != -1 and r or None,
+            b'ZRANK': int_or_none,
         }
         )
 
     # commands that should NOT pull data off the network buffer when executed
     SUBSCRIPTION_COMMANDS = set([
-        'SUBSCRIBE', 'UNSUBSCRIBE', 'PSUBSCRIBE', 'PUNSUBSCRIBE'
+        b'SUBSCRIBE', b'UNSUBSCRIBE', b'PSUBSCRIBE', b'PUNSUBSCRIBE'
         ])
 
     def __init__(self, host='localhost', port=6379,
                  db=0, password=None, socket_timeout=None,
-                 connection_pool=None,
-                 charset='utf-8', errors='strict'):
-        self.encoding = charset
-        self.errors = errors
+                 connection_pool=None):
         self.connection = None
         self.subscribed = False
-        self.connection_pool = connection_pool and connection_pool or ConnectionPool()
+        self.connection_pool = connection_pool if connection_pool else ConnectionPool()
         self.select(db, host, port, password, socket_timeout)
 
     #### Legacty accessors of connection information ####
@@ -312,6 +331,16 @@ class Redis(threading.local):
         return Lock(self, name, timeout=timeout, sleep=sleep)
 
     #### COMMAND EXECUTION AND PROTOCOL PARSING ####
+    def encode(self,value):
+        if isinstance(value,collections.ByteString):
+            return value
+        elif isinstance(value,numbers.Number):
+            return str(value).encode('ascii')
+        elif isinstance(value,str):
+            return value.encode('utf-8')
+        else:
+            raise TypeError("Expected a string or a number")
+
     def _execute_command(self, command_name, command, **options):
         subscription_command = command_name in self.SUBSCRIPTION_COMMANDS
         if self.subscribed and not subscription_command:
@@ -331,11 +360,17 @@ class Redis(threading.local):
 
     def execute_command(self, *args, **options):
         "Sends the command to the redis server and returns it's response"
-        cmds = ['$%s\r\n%s\r\n' % (len(enc_value), enc_value)
-                for enc_value in imap(self.encode, args)]
+#        cmds = ['$%s\r\n%s\r\n' % (len(enc_value), enc_value)
+#                for enc_value in imap(self.encode, args)]
+
+        encoded_values = (self.encode(value) for value in args)
+
+        cmds = [b'$'+str(len(value)).encode('ascii')+b'\r\n' + value + b'\r\n'
+                for value in encoded_values]
+
         return self._execute_command(
             args[0],
-            '*%s\r\n%s' % (len(cmds), ''.join(cmds)),
+            b'*'+str(len(cmds)).encode('ascii')+b'\r\n' + b''.join(cmds),
             **options
             )
 
@@ -347,31 +382,31 @@ class Redis(threading.local):
             raise ConnectionError("Socket closed on remote end")
 
         # server returned a null value
-        if response in ('$-1', '*-1'):
+        if response in (b'$-1', b'*-1'):
             return None
-        byte, response = response[0], response[1:]
+        byte, response = response[0:1], response[1:]
 
         # server returned an error
-        if byte == '-':
-            if response.startswith('ERR '):
+        if byte == b'-':
+            if response.startswith(b'ERR '):
                 response = response[4:]
             raise ResponseError(response)
         # single value
-        elif byte == '+':
+        elif byte == b'+':
             return response
         # int value
-        elif byte == ':':
+        elif byte == b':':
             return int(response)
         # bulk response
-        elif byte == '$':
+        elif byte == b'$':
             length = int(response)
             if length == -1:
                 return None
-            response = length and conn.read(length) or ''
+            response = length and conn.read(length) or b''
             conn.read(2) # read the \r\n delimiter
             return response
         # multi-bulk response
-        elif byte == '*':
+        elif byte == b'*':
             length = int(response)
             if length == -1:
                 return None
@@ -388,7 +423,7 @@ class Redis(threading.local):
                         data.append(
                             self._parse_response(command_name, catch_errors)
                             )
-                    except Exception, e:
+                    except Exception as e:
                         data.append(e)
                 return data
 
@@ -400,15 +435,6 @@ class Redis(threading.local):
         if command_name in self.RESPONSE_CALLBACKS:
             return self.RESPONSE_CALLBACKS[command_name](response, **options)
         return response
-
-    def encode(self, value):
-        "Encode ``value`` using the instance's charset"
-        if isinstance(value, str):
-            return value
-        if isinstance(value, unicode):
-            return value.encode(self.encoding, self.errors)
-        # not a string or unicode, attempt to convert to a string
-        return str(value)
 
     #### CONNECTION HANDLING ####
     def get_connection(self, host, port, db, password, socket_timeout):
@@ -428,9 +454,9 @@ class Redis(threading.local):
         the appropriate database.
         """
         if self.connection.password:
-            if not self.execute_command('AUTH', self.connection.password):
+            if not self.execute_command(b'AUTH', self.connection.password):
                 raise AuthenticationError("Invalid Password")
-        self.execute_command('SELECT', self.connection.db)
+        self.execute_command(b'SELECT', self.connection.db)
 
     def select(self, db, host=None, port=None, password=None,
             socket_timeout=None):
@@ -462,7 +488,7 @@ class Redis(threading.local):
         if self.subscribed:
             raise RedisError("Can't call 'shutdown' from a pipeline'")
         try:
-            self.execute_command('SHUTDOWN')
+            self.execute_command(b'SHUTDOWN')
         except ConnectionError:
             # a ConnectionError here is expected
             return
@@ -472,69 +498,61 @@ class Redis(threading.local):
     #### SERVER INFORMATION ####
     def bgrewriteaof(self):
         "Tell the Redis server to rewrite the AOF file from data in memory."
-        return self.execute_command('BGREWRITEAOF')
+        return self.execute_command(b'BGREWRITEAOF')
 
     def bgsave(self):
         """
         Tell the Redis server to save its data to disk.  Unlike save(),
         this method is asynchronous and returns immediately.
         """
-        return self.execute_command('BGSAVE')
+        return self.execute_command(b'BGSAVE')
 
     def config_get(self, pattern="*"):
         "Return a dictionary of configuration based on the ``pattern``"
-        return self.execute_command('CONFIG', 'GET', pattern, parse='GET')
+        return self.execute_command(b'CONFIG', b'GET', pattern, parse=b'GET')
 
     def config_set(self, name, value):
         "Set config item ``name`` with ``value``"
-        return self.execute_command('CONFIG', 'SET', name, value, parse='SET')
+        return self.execute_command(b'CONFIG', b'SET', name, value, parse=b'SET')
 
     def dbsize(self):
         "Returns the number of keys in the current database"
-        return self.execute_command('DBSIZE')
+        return self.execute_command(b'DBSIZE')
 
     def delete(self, *names):
         "Delete one or more keys specified by ``names``"
-        return self.execute_command('DEL', *names)
+        return self.execute_command(b'DEL', *names)
     __delitem__ = delete
-
-    def flush(self, all_dbs=False):
-        warnings.warn(DeprecationWarning(
-            "'flush' has been deprecated. "
-            "Use Redis.flushdb() or Redis.flushall() instead"))
-        if all_dbs:
-            return self.flushall()
-        return self.flushdb()
 
     def flushall(self):
         "Delete all keys in all databases on the current host"
-        return self.execute_command('FLUSHALL')
+        return self.execute_command(b'FLUSHALL')
 
     def flushdb(self):
         "Delete all keys in the current database"
-        return self.execute_command('FLUSHDB')
+        return self.execute_command(b'FLUSHDB')
 
     def info(self):
         "Returns a dictionary containing information about the Redis server"
-        return self.execute_command('INFO')
+        return self.execute_command(b'INFO')
 
     def lastsave(self):
         """
         Return a Python datetime object representing the last time the
         Redis database was saved to disk
         """
-        return self.execute_command('LASTSAVE')
+        return self.execute_command(b'LASTSAVE')
 
     def ping(self):
         "Ping the Redis server"
-        return self.execute_command('PING')
+        return self.execute_command(b'PING')
 
     def save(self):
         """
         Tell the Redis server to save its data to disk,
         blocking until the save is complete
         """
-        return self.execute_command('SAVE')
+        return self.execute_command(b'SAVE')
 
     def slaveof(self, host=None, port=None):
         """
@@ -543,7 +561,7 @@ class Redis(threading.local):
         instance is promoted to a master instead.
         """
         if host is None and port is None:
-            return self.execute_command("SLAVEOF", "NO", "ONE")
+            return self.execute_command("SLAVEOF NO ONE")
         return self.execute_command("SLAVEOF", host, port)
 
     #### BASIC KEY COMMANDS ####
@@ -553,23 +571,23 @@ class Redis(threading.local):
         doesn't already exist, create it with a value of ``value``.
         Returns the new length of the value at ``key``.
         """
-        return self.execute_command('APPEND', key, value)
+        return self.execute_command(b'APPEND', key, value)
 
     def decr(self, name, amount=1):
         """
         Decrements the value of ``key`` by ``amount``.  If no key exists,
         the value will be initialized as 0 - ``amount``
         """
-        return self.execute_command('DECRBY', name, amount)
+        return self.execute_command(b'DECRBY', name, amount)
 
     def exists(self, name):
         "Returns a boolean indicating whether key ``name`` exists"
-        return self.execute_command('EXISTS', name)
+        return self.execute_command(b'EXISTS', name)
     __contains__ = exists
 
     def expire(self, name, time):
         "Set an expire flag on key ``name`` for ``time`` seconds"
-        return self.execute_command('EXPIRE', name, time)
+        return self.execute_command(b'EXPIRE', name, time)
 
     def expireat(self, name, when):
         """
@@ -578,52 +596,49 @@ class Redis(threading.local):
         """
         if isinstance(when, datetime.datetime):
             when = int(time.mktime(when.timetuple()))
-        return self.execute_command('EXPIREAT', name, when)
+        return self.execute_command(b'EXPIREAT', name, when)
 
     def get(self, name):
         """
         Return the value at key ``name``, or None of the key doesn't exist
         """
-        return self.execute_command('GET', name)
+        return self.execute_command(b'GET', name)
     __getitem__ = get
 
     def getbit(self, name, offset):
         "Returns a boolean indicating the value of ``offset`` in ``name``"
-        return self.execute_command('GETBIT', name, offset)
+        return self.execute_command(b'GETBIT', name, offset)
 
     def getset(self, name, value):
         """
         Set the value at key ``name`` to ``value`` if key doesn't exist
         Return the value at key ``name`` atomically
         """
-        return self.execute_command('GETSET', name, value)
+        return self.execute_command(b'GETSET', name, value)
 
     def incr(self, name, amount=1):
         """
         Increments the value of ``key`` by ``amount``.  If no key exists,
         the value will be initialized as ``amount``
         """
-        return self.execute_command('INCRBY', name, amount)
+        return self.execute_command(b'INCRBY', name, amount)
 
-    def keys(self, pattern='*'):
+    def keys(self, pattern=b'*'):
         "Returns a list of keys matching ``pattern``"
-        return self.execute_command('KEYS', pattern)
+        return self.execute_command(b'KEYS', pattern)
 
-    def mget(self, keys, *args):
+    def mget(self, keys):
         """
         Returns a list of values ordered identically to ``keys``
-
-        * Passing *args to this method has been deprecated *
         """
-        keys = list_or_args('mget', keys, args)
-        return self.execute_command('MGET', *keys)
+        return self.execute_command(b'MGET', *keys)
 
     def mset(self, mapping):
         "Sets each key in the ``mapping`` dict to its corresponding value"
         items = []
-        for pair in mapping.iteritems():
+        for pair in mapping.items():
             items.extend(pair)
-        return self.execute_command('MSET', *items)
+        return self.execute_command(b'MSET', *items)
 
     def msetnx(self, mapping):
         """
@@ -631,23 +646,23 @@ class Redis(threading.local):
         none of the keys are already set
         """
         items = []
-        for pair in mapping.iteritems():
+        for pair in mapping.items():
             items.extend(pair)
-        return self.execute_command('MSETNX', *items)
+        return self.execute_command(b'MSETNX', *items)
 
     def move(self, name, db):
         "Moves the key ``name`` to a different Redis database ``db``"
-        return self.execute_command('MOVE', name, db)
+        return self.execute_command(b'MOVE', name, db)
 
     def persist(self, name):
         "Removes an expiration on ``name``"
-        return self.execute_command('PERSIST', name)
+        return self.execute_command(b'PERSIST', name)
 
     def randomkey(self):
         "Returns the name of a random key"
-        return self.execute_command('RANDOMKEY')
+        return self.execute_command(b'RANDOMKEY')
 
-    def rename(self, src, dst, **kwargs):
+    def rename(self, src, dst):
         """
         Rename key ``src`` to ``dst``
 
@@ -655,44 +670,18 @@ class Redis(threading.local):
         If ``preserve`` is True, rename the key only if the destination name
             doesn't already exist
         """
-        if kwargs:
-            if 'preserve' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "preserve option to 'rename' is deprecated, "
-                    "use Redis.renamenx instead"))
-                if kwargs['preserve']:
-                    return self.renamenx(src, dst)
-        return self.execute_command('RENAME', src, dst)
+        return self.execute_command(b'RENAME', src, dst)
 
     def renamenx(self, src, dst):
         "Rename key ``src`` to ``dst`` if ``dst`` doesn't already exist"
-        return self.execute_command('RENAMENX', src, dst)
+        return self.execute_command(b'RENAMENX', src, dst)
 
 
-    def set(self, name, value, **kwargs):
+    def set(self, name, value):
         """
         Set the value at key ``name`` to ``value``
-
-        * The following flags have been deprecated *
-        If ``preserve`` is True, set the value only if key doesn't already
-        exist
-        If ``getset`` is True, set the value only if key doesn't already exist
-        and return the resulting value of key
         """
-        if kwargs:
-            if 'getset' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "getset option to 'set' is deprecated, "
-                    "use Redis.getset() instead"))
-                if kwargs['getset']:
-                    return self.getset(name, value)
-            if 'preserve' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "preserve option to 'set' is deprecated, "
-                    "use Redis.setnx() instead"))
-                if kwargs['preserve']:
-                    return self.setnx(name, value)
-        return self.execute_command('SET', name, value)
+        return self.execute_command(b'SET', name, value)
     __setitem__ = set
 
     def setbit(self, name, offset, value):
@@ -701,18 +690,18 @@ class Redis(threading.local):
         indicating the previous value of ``offset``.
         """
         value = value and 1 or 0
-        return self.execute_command('SETBIT', name, offset, value)
+        return self.execute_command(b'SETBIT', name, offset, value)
 
     def setex(self, name, value, time):
         """
         Set the value of key ``name`` to ``value``
         that expires in ``time`` seconds
         """
-        return self.execute_command('SETEX', name, time, value)
+        return self.execute_command(b'SETEX', name, time, value)
 
     def setnx(self, name, value):
         "Set the value of key ``name`` to ``value`` if key doesn't exist"
-        return self.execute_command('SETNX', name, value)
+        return self.execute_command(b'SETNX', name, value)
 
     def setrange(self, name, offset, value):
         """
@@ -725,26 +714,26 @@ class Redis(threading.local):
 
         Returns the length of the new string.
         """
-        return self.execute_command('SETRANGE', name, offset, value)
+        return self.execute_command(b'SETRANGE', name, offset, value)
 
     def strlen(self, name):
         "Return the number of bytes stored in the value of ``name``"
-        return self.execute_command('STRLEN', name)
+        return self.execute_command(b'STRLEN', name)
 
     def substr(self, name, start, end=-1):
         """
         Return a substring of the string at key ``name``. ``start`` and ``end``
         are 0-based integers specifying the portion of the string to return.
         """
-        return self.execute_command('SUBSTR', name, start, end)
+        return self.execute_command(b'SUBSTR', name, start, end)
 
     def ttl(self, name):
         "Returns the number of seconds until the key ``name`` will expire"
-        return self.execute_command('TTL', name)
+        return self.execute_command(b'TTL', name)
 
     def type(self, name):
         "Returns the type of key ``name``"
-        return self.execute_command('TYPE', name)
+        return self.execute_command(b'TYPE', name)
 
     def watch(self, name):
         """
@@ -753,7 +742,7 @@ class Redis(threading.local):
         if self.subscribed:
             raise RedisError("Can't call 'watch' from a pipeline'")
 
-        return self.execute_command('WATCH', name)
+        return self.execute_command(b'WATCH', name)
 
     def unwatch(self):
         """
@@ -762,7 +751,7 @@ class Redis(threading.local):
         if self.subscribed:
             raise RedisError("Can't call 'unwatch' from a pipeline'")
 
-        return self.execute_command('UNWATCH')
+        return self.execute_command(b'UNWATCH')
 
     #### LIST COMMANDS ####
     def blpop(self, keys, timeout=0):
@@ -778,12 +767,12 @@ class Redis(threading.local):
         """
         if timeout is None:
             timeout = 0
-        if isinstance(keys, basestring):
+        if isinstance(keys,redis_string_types):
             keys = [keys]
         else:
             keys = list(keys)
         keys.append(timeout)
-        return self.execute_command('BLPOP', *keys)
+        return self.execute_command(b'BLPOP', *keys)
 
     def brpop(self, keys, timeout=0):
         """
@@ -798,12 +787,12 @@ class Redis(threading.local):
         """
         if timeout is None:
             timeout = 0
-        if isinstance(keys, basestring):
+        if isinstance(keys, redis_string_types):
             keys = [keys]
         else:
             keys = list(keys)
         keys.append(timeout)
-        return self.execute_command('BRPOP', *keys)
+        return self.execute_command(b'BRPOP', *keys)
 
     def brpoplpush(self, src, dst, timeout=0):
         """
@@ -816,7 +805,7 @@ class Redis(threading.local):
         """
         if timeout is None:
             timeout = 0
-        return self.execute_command('BRPOPLPUSH', src, dst, timeout)
+        return self.execute_command(b'BRPOPLPUSH', src, dst, timeout)
 
     def lindex(self, name, index):
         """
@@ -825,7 +814,7 @@ class Redis(threading.local):
         Negative indexes are supported and will return an item at the
         end of the list
         """
-        return self.execute_command('LINDEX', name, index)
+        return self.execute_command(b'LINDEX', name, index)
     
     def linsert(self, name, where, refvalue, value):
         """
@@ -835,23 +824,23 @@ class Redis(threading.local):
         Returns the new length of the list on success or -1 if ``refvalue``
         is not in the list.
         """
-        return self.execute_command('LINSERT', name, where, refvalue, value)
+        return self.execute_command(b'LINSERT', name, where, refvalue, value)
     
     def llen(self, name):
         "Return the length of the list ``name``"
-        return self.execute_command('LLEN', name)
+        return self.execute_command(b'LLEN', name)
 
     def lpop(self, name):
         "Remove and return the first item of the list ``name``"
-        return self.execute_command('LPOP', name)
+        return self.execute_command(b'LPOP', name)
 
     def lpush(self, name, value):
         "Push ``value`` onto the head of the list ``name``"
-        return self.execute_command('LPUSH', name, value)
+        return self.execute_command(b'LPUSH', name, value)
     
     def lpushx(self, name, value):
         "Push ``value`` onto the head of the list ``name`` if ``name`` exists"
-        return self.execute_command('LPUSHX', name, value)
+        return self.execute_command(b'LPUSHX', name, value)
 
     def lrange(self, name, start, end):
         """
@@ -861,7 +850,7 @@ class Redis(threading.local):
         ``start`` and ``end`` can be negative numbers just like
         Python slicing notation
         """
-        return self.execute_command('LRANGE', name, start, end)
+        return self.execute_command(b'LRANGE', name, start, end)
 
     def lrem(self, name, value, num=0):
         """
@@ -869,11 +858,11 @@ class Redis(threading.local):
 
         If ``num`` is 0, then all occurrences will be removed
         """
-        return self.execute_command('LREM', name, num, value)
+        return self.execute_command(b'LREM', name, num, value)
 
     def lset(self, name, index, value):
         "Set ``position`` of list ``name`` to ``value``"
-        return self.execute_command('LSET', name, index, value)
+        return self.execute_command(b'LSET', name, index, value)
 
     def ltrim(self, name, start, end):
         """
@@ -883,54 +872,26 @@ class Redis(threading.local):
         ``start`` and ``end`` can be negative numbers just like
         Python slicing notation
         """
-        return self.execute_command('LTRIM', name, start, end)
-
-    def pop(self, name, tail=False):
-        """
-        Pop and return the first or last element of list ``name``
-
-        * This method has been deprecated,
-          use Redis.lpop or Redis.rpop instead *
-        """
-        warnings.warn(DeprecationWarning(
-            "Redis.pop has been deprecated, "
-            "use Redis.lpop or Redis.rpop instead"))
-        if tail:
-            return self.rpop(name)
-        return self.lpop(name)
-
-    def push(self, name, value, head=False):
-        """
-        Push ``value`` onto list ``name``.
-
-        * This method has been deprecated,
-          use Redis.lpush or Redis.rpush instead *
-        """
-        warnings.warn(DeprecationWarning(
-            "Redis.push has been deprecated, "
-            "use Redis.lpush or Redis.rpush instead"))
-        if head:
-            return self.lpush(name, value)
-        return self.rpush(name, value)
+        return self.execute_command(b'LTRIM', name, start, end)
 
     def rpop(self, name):
         "Remove and return the last item of the list ``name``"
-        return self.execute_command('RPOP', name)
+        return self.execute_command(b'RPOP', name)
 
     def rpoplpush(self, src, dst):
         """
         RPOP a value off of the ``src`` list and atomically LPUSH it
         on to the ``dst`` list.  Returns the value.
         """
-        return self.execute_command('RPOPLPUSH', src, dst)
+        return self.execute_command(b'RPOPLPUSH', src, dst)
 
     def rpush(self, name, value):
         "Push ``value`` onto the tail of the list ``name``"
-        return self.execute_command('RPUSH', name, value)
+        return self.execute_command(b'RPUSH', name, value)
 
     def rpushx(self, name, value):
         "Push ``value`` onto the tail of the list ``name`` if ``name`` exists"
-        return self.execute_command('RPUSHX', name, value)
+        return self.execute_command(b'RPUSHX', name, value)
 
     def sort(self, name, start=None, num=None, by=None, get=None,
              desc=False, alpha=False, store=None):
@@ -959,10 +920,10 @@ class Redis(threading.local):
 
         pieces = [name]
         if by is not None:
-            pieces.append('BY')
+            pieces.append(b'BY')
             pieces.append(by)
         if start is not None and num is not None:
-            pieces.append('LIMIT')
+            pieces.append(b'LIMIT')
             pieces.append(start)
             pieces.append(num)
         if get is not None:
@@ -970,124 +931,105 @@ class Redis(threading.local):
             # Otherwise assume it's an interable and we want to get multiple
             # values. We can't just iterate blindly because strings are
             # iterable.
-            if isinstance(get, basestring):
-                pieces.append('GET')
+            if isinstance(get, redis_string_types):
+                pieces.append(b'GET')
                 pieces.append(get)
             else:
                 for g in get:
-                    pieces.append('GET')
+                    pieces.append(b'GET')
                     pieces.append(g)
         if desc:
-            pieces.append('DESC')
+            pieces.append(b'DESC')
         if alpha:
-            pieces.append('ALPHA')
+            pieces.append(b'ALPHA')
         if store is not None:
-            pieces.append('STORE')
+            pieces.append(b'STORE')
             pieces.append(store)
-        return self.execute_command('SORT', *pieces)
+        return self.execute_command(b'SORT', *pieces)
 
 
     #### SET COMMANDS ####
     def sadd(self, name, value):
         "Add ``value`` to set ``name``"
-        return self.execute_command('SADD', name, value)
+        return self.execute_command(b'SADD', name, value)
 
     def scard(self, name):
         "Return the number of elements in set ``name``"
-        return self.execute_command('SCARD', name)
+        return self.execute_command(b'SCARD', name)
 
-    def sdiff(self, keys, *args):
+    def sdiff(self, keys):
         "Return the difference of sets specified by ``keys``"
-        keys = list_or_args('sdiff', keys, args)
-        return self.execute_command('SDIFF', *keys)
+        return self.execute_command(b'SDIFF', *keys)
 
-    def sdiffstore(self, dest, keys, *args):
+    def sdiffstore(self, dest, keys):
         """
         Store the difference of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sdiffstore', keys, args)
-        return self.execute_command('SDIFFSTORE', dest, *keys)
+        return self.execute_command(b'SDIFFSTORE', dest, *keys)
 
-    def sinter(self, keys, *args):
+    def sinter(self, keys):
         "Return the intersection of sets specified by ``keys``"
-        keys = list_or_args('sinter', keys, args)
-        return self.execute_command('SINTER', *keys)
+        return self.execute_command(b'SINTER', *keys)
 
-    def sinterstore(self, dest, keys, *args):
+    def sinterstore(self, dest, keys):
         """
         Store the intersection of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sinterstore', keys, args)
-        return self.execute_command('SINTERSTORE', dest, *keys)
+        return self.execute_command(b'SINTERSTORE', dest, *keys)
 
     def sismember(self, name, value):
         "Return a boolean indicating if ``value`` is a member of set ``name``"
-        return self.execute_command('SISMEMBER', name, value)
+        return self.execute_command(b'SISMEMBER', name, value)
 
     def smembers(self, name):
         "Return all members of the set ``name``"
-        return self.execute_command('SMEMBERS', name)
+        return self.execute_command(b'SMEMBERS', name)
 
     def smove(self, src, dst, value):
         "Move ``value`` from set ``src`` to set ``dst`` atomically"
-        return self.execute_command('SMOVE', src, dst, value)
+        return self.execute_command(b'SMOVE', src, dst, value)
 
     def spop(self, name):
         "Remove and return a random member of set ``name``"
-        return self.execute_command('SPOP', name)
+        return self.execute_command(b'SPOP', name)
 
     def srandmember(self, name):
         "Return a random member of set ``name``"
-        return self.execute_command('SRANDMEMBER', name)
+        return self.execute_command(b'SRANDMEMBER', name)
 
     def srem(self, name, value):
         "Remove ``value`` from set ``name``"
-        return self.execute_command('SREM', name, value)
+        return self.execute_command(b'SREM', name, value)
 
-    def sunion(self, keys, *args):
+    def sunion(self, keys):
         "Return the union of sets specifiued by ``keys``"
-        keys = list_or_args('sunion', keys, args)
-        return self.execute_command('SUNION', *keys)
+        return self.execute_command(b'SUNION', *keys)
 
-    def sunionstore(self, dest, keys, *args):
+    def sunionstore(self, dest, keys):
         """
         Store the union of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sunionstore', keys, args)
-        return self.execute_command('SUNIONSTORE', dest, *keys)
+        return self.execute_command(b'SUNIONSTORE', dest, *keys)
 
 
     #### SORTED SET COMMANDS ####
     def zadd(self, name, value, score):
         "Add member ``value`` with score ``score`` to sorted set ``name``"
-        return self.execute_command('ZADD', name, score, value)
+        return self.execute_command(b'ZADD', name, score, value)
 
     def zcard(self, name):
         "Return the number of elements in the sorted set ``name``"
-        return self.execute_command('ZCARD', name)
+        return self.execute_command(b'ZCARD', name)
 
     def zcount(self, name, min, max):
-        return self.execute_command('ZCOUNT', name, min, max)
-
-    def zincr(self, key, member, value=1):
-        "This has been deprecated, use zincrby instead"
-        warnings.warn(DeprecationWarning(
-            "Redis.zincr has been deprecated, use Redis.zincrby instead"
-            ))
-        return self.zincrby(key, member, value)
+        return self.execute_command(b'ZCOUNT', name, min, max)
 
     def zincrby(self, name, value, amount=1):
         "Increment the score of ``value`` in sorted set ``name`` by ``amount``"
-        return self.execute_command('ZINCRBY', name, amount, value)
-
-    def zinter(self, dest, keys, aggregate=None):
-        warnings.warn(DeprecationWarning(
-            "Redis.zinter has been deprecated, use Redis.zinterstore instead"
-            ))
-        return self.zinterstore(dest, keys, aggregate)
+        return self.execute_command(b'ZINCRBY', name, amount, value)
 
     def zinterstore(self, dest, keys, aggregate=None):
         """
@@ -1142,11 +1084,11 @@ class Redis(threading.local):
         Returns a 0-based value indicating the rank of ``value`` in sorted set
         ``name``
         """
-        return self.execute_command('ZRANK', name, value)
+        return self.execute_command(b'ZRANK', name, value)
 
     def zrem(self, name, value):
         "Remove member ``value`` from sorted set ``name``"
-        return self.execute_command('ZREM', name, value)
+        return self.execute_command(b'ZREM', name, value)
 
     def zremrangebyrank(self, name, min, max):
         """
@@ -1155,14 +1097,14 @@ class Redis(threading.local):
         to largest. Values can be negative indicating the highest scores.
         Returns the number of elements removed
         """
-        return self.execute_command('ZREMRANGEBYRANK', name, min, max)
+        return self.execute_command(b'ZREMRANGEBYRANK', name, min, max)
 
     def zremrangebyscore(self, name, min, max):
         """
         Remove all elements in the sorted set ``name`` with scores
         between ``min`` and ``max``. Returns the number of elements removed.
         """
-        return self.execute_command('ZREMRANGEBYSCORE', name, min, max)
+        return self.execute_command(b'ZREMRANGEBYSCORE', name, min, max)
 
     def zrevrange(self, name, start, num, withscores=False):
         """
@@ -1184,17 +1126,11 @@ class Redis(threading.local):
         Returns a 0-based value indicating the descending rank of
         ``value`` in sorted set ``name``
         """
-        return self.execute_command('ZREVRANK', name, value)
+        return self.execute_command(b'ZREVRANK', name, value)
 
     def zscore(self, name, value):
         "Return the score of element ``value`` in sorted set ``name``"
-        return self.execute_command('ZSCORE', name, value)
-
-    def zunion(self, dest, keys, aggregate=None):
-        warnings.warn(DeprecationWarning(
-            "Redis.zunion has been deprecated, use Redis.zunionstore instead"
-            ))
-        return self.zunionstore(dest, keys, aggregate)
+        return self.execute_command(b'ZSCORE', name, value)
 
     def zunionstore(self, dest, keys, aggregate=None):
         """
@@ -1202,60 +1138,60 @@ class Redis(threading.local):
         a new sorted set, ``dest``. Scores in the destination will be
         aggregated based on the ``aggregate``, or SUM if none is provided.
         """
-        return self._zaggregate('ZUNIONSTORE', dest, keys, aggregate)
+        return self._zaggregate(b'ZUNIONSTORE', dest, keys, aggregate)
 
     def _zaggregate(self, command, dest, keys, aggregate=None):
         pieces = [command, dest, len(keys)]
         if isinstance(keys, dict):
-            items = keys.items()
+            items = list(keys.items())
             keys = [i[0] for i in items]
             weights = [i[1] for i in items]
         else:
             weights = None
         pieces.extend(keys)
         if weights:
-            pieces.append('WEIGHTS')
+            pieces.append(b'WEIGHTS')
             pieces.extend(weights)
         if aggregate:
-            pieces.append('AGGREGATE')
+            pieces.append(b'AGGREGATE')
             pieces.append(aggregate)
         return self.execute_command(*pieces)
 
     #### HASH COMMANDS ####
     def hdel(self, name, key):
         "Delete ``key`` from hash ``name``"
-        return self.execute_command('HDEL', name, key)
+        return self.execute_command(b'HDEL', name, key)
 
     def hexists(self, name, key):
         "Returns a boolean indicating if ``key`` exists within hash ``name``"
-        return self.execute_command('HEXISTS', name, key)
+        return self.execute_command(b'HEXISTS', name, key)
 
     def hget(self, name, key):
         "Return the value of ``key`` within the hash ``name``"
-        return self.execute_command('HGET', name, key)
+        return self.execute_command(b'HGET', name, key)
 
     def hgetall(self, name):
         "Return a Python dict of the hash's name/value pairs"
-        return self.execute_command('HGETALL', name)
+        return self.execute_command(b'HGETALL', name)
 
     def hincrby(self, name, key, amount=1):
         "Increment the value of ``key`` in hash ``name`` by ``amount``"
-        return self.execute_command('HINCRBY', name, key, amount)
+        return self.execute_command(b'HINCRBY', name, key, amount)
 
     def hkeys(self, name):
         "Return the list of keys within hash ``name``"
-        return self.execute_command('HKEYS', name)
+        return self.execute_command(b'HKEYS', name)
 
     def hlen(self, name):
         "Return the number of elements in hash ``name``"
-        return self.execute_command('HLEN', name)
+        return self.execute_command(b'HLEN', name)
 
     def hset(self, name, key, value):
         """
         Set ``key`` to ``value`` within hash ``name``
         Returns 1 if HSET created a new field, otherwise 0
         """
-        return self.execute_command('HSET', name, key, value)
+        return self.execute_command(b'HSET', name, key, value)
 
     def hsetnx(self, name, key, value):
         """
@@ -1270,25 +1206,25 @@ class Redis(threading.local):
         in the hash ``name``
         """
         items = []
-        for pair in mapping.iteritems():
+        for pair in mapping.items():
             items.extend(pair)
-        return self.execute_command('HMSET', name, *items)
+        return self.execute_command(b'HMSET', name, *items)
 
     def hmget(self, name, keys):
         "Returns a list of values ordered identically to ``keys``"
-        return self.execute_command('HMGET', name, *keys)
+        return self.execute_command(b'HMGET', name, *keys)
 
     def hvals(self, name):
         "Return the list of values within hash ``name``"
-        return self.execute_command('HVALS', name)
+        return self.execute_command(b'HVALS', name)
 
 
     # channels
     def psubscribe(self, patterns):
         "Subscribe to all channels matching any pattern in ``patterns``"
-        if isinstance(patterns, basestring):
+        if isinstance(patterns, redis_string_types):
             patterns = [patterns]
-        response = self.execute_command('PSUBSCRIBE', *patterns)
+        response = self.execute_command(b'PSUBSCRIBE', *patterns)
         # this is *after* the SUBSCRIBE in order to allow for lazy and broken
         # connections that need to issue AUTH and SELECT commands
         self.subscribed = True
@@ -1299,15 +1235,15 @@ class Redis(threading.local):
         Unsubscribe from any channel matching any pattern in ``patterns``.
         If empty, unsubscribe from all channels.
         """
-        if isinstance(patterns, basestring):
+        if isinstance(patterns, redis_string_types):
             patterns = [patterns]
-        return self.execute_command('PUNSUBSCRIBE', *patterns)
+        return self.execute_command(b'PUNSUBSCRIBE', *patterns)
 
     def subscribe(self, channels):
         "Subscribe to ``channels``, waiting for messages to be published"
-        if isinstance(channels, basestring):
+        if isinstance(channels, redis_string_types):
             channels = [channels]
-        response = self.execute_command('SUBSCRIBE', *channels)
+        response = self.execute_command(b'SUBSCRIBE', *channels)
         # this is *after* the SUBSCRIBE in order to allow for lazy and broken
         # connections that need to issue AUTH and SELECT commands
         self.subscribed = True
@@ -1318,22 +1254,22 @@ class Redis(threading.local):
         Unsubscribe from ``channels``. If empty, unsubscribe
         from all channels
         """
-        if isinstance(channels, basestring):
+        if isinstance(channels, redis_string_types):
             channels = [channels]
-        return self.execute_command('UNSUBSCRIBE', *channels)
+        return self.execute_command(b'UNSUBSCRIBE', *channels)
 
     def publish(self, channel, message):
         """
         Publish ``message`` on ``channel``.
         Returns the number of subscribers the message was delivered to.
         """
-        return self.execute_command('PUBLISH', channel, message)
+        return self.execute_command(b'PUBLISH', channel, message)
 
     def listen(self):
         "Listen for messages on channels this client has been subscribed to"
         while self.subscribed:
-            r = self.parse_response('LISTEN')
-            if r[0] == 'pmessage':
+            r = self.parse_response(b'LISTEN')
+            if r[0] == b'pmessage':
                 msg = {
                 'type': r[0],
                 'pattern': r[1],
@@ -1347,7 +1283,7 @@ class Redis(threading.local):
                 'channel': r[1],
                 'data': r[2]
                 }
-            if r[0] == 'unsubscribe' and r[2] == 0:
+            if r[0] == b'unsubscribe' and r[2] == 0:
                 self.subscribed = False
             yield msg
 
@@ -1370,11 +1306,9 @@ class Pipeline(Redis):
     ResponseError exceptions, such as those raised when issuing a command
     on a key of a different datatype.
     """
-    def __init__(self, connection, transaction, charset, errors):
+    def __init__(self, connection, transaction):
         self.connection = connection
         self.transaction = transaction
-        self.encoding = charset
-        self.errors = errors
         self.subscribed = False # NOTE not in use, but necessary
         self.reset()
 
@@ -1397,7 +1331,7 @@ class Pipeline(Redis):
         # must have originated after a socket connection and a call to
         # _setup_connection(). run these commands immediately without
         # buffering them.
-        if command_name in ('AUTH', 'SELECT'):
+        if command_name in (b'AUTH', b'SELECT'):
             return super(Pipeline, self)._execute_command(
                 command_name, command, **options)
         else:
@@ -1407,17 +1341,17 @@ class Pipeline(Redis):
     def _execute_transaction(self, commands):
         # wrap the commands in MULTI ... EXEC statements to indicate an
         # atomic operation
-        all_cmds = ''.join([c for _1, c, _2 in chain(
-            (('', 'MULTI\r\n', ''),),
+        all_cmds = b''.join([c for _1, c, _2 in itertools.chain(
+            ((b'', b'MULTI\r\n', b''),),
             commands,
-            (('', 'EXEC\r\n', ''),)
+            ((b'', b'EXEC\r\n', b''),)
             )])
         self.connection.send(all_cmds, self)
         # parse off the response for MULTI and all commands prior to EXEC
         for i in range(len(commands)+1):
-            _ = self.parse_response('_')
+            _ = self.parse_response(b'_')
         # parse the EXEC. we want errors returned as items in the response
-        response = self.parse_response('_', catch_errors=True)
+        response = self.parse_response(b'_', catch_errors=True)
 
         if response is None:
             raise WatchError("Watched variable changed.")
@@ -1436,7 +1370,7 @@ class Pipeline(Redis):
 
     def _execute_pipeline(self, commands):
         # build up all commands into a single request to increase network perf
-        all_cmds = ''.join([c for _1, c, _2 in commands])
+        all_cmds = b''.join([c for _1, c, _2 in commands])
         self.connection.send(all_cmds, self)
         data = []
         for command_name, _, options in commands:
@@ -1523,10 +1457,10 @@ class Lock(object):
                 return True
             # We want blocking, but didn't acquire the lock
             # check to see if the current lock is expired
-            existing = long(self.redis.get(self.name) or 1)
+            existing = int(self.redis.get(self.name) or 1)
             if existing < unixtime:
                 # the previous lock is expired, attempt to overwrite it
-                existing = long(self.redis.getset(self.name, timeout_at) or 1)
+                existing = int(self.redis.getset(self.name, timeout_at) or 1)
                 if existing < unixtime:
                     # we successfully acquired the lock
                     self.acquired_until = timeout_at
@@ -1539,7 +1473,7 @@ class Lock(object):
         "Releases the already acquired lock"
         if self.acquired_until is None:
             raise ValueError("Cannot release an unlocked lock")
-        existing = long(self.redis.get(self.name) or 1)
+        existing = int(self.redis.get(self.name) or 1)
         # if the lock time is in the future, delete the lock
         if existing >= self.acquired_until:
             self.redis.delete(self.name)
